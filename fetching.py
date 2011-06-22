@@ -1,7 +1,11 @@
 #!/usr/bin/env python
 
+# seriously, fuck python 2.5
+from __future__ import with_statement
+
 import gevent
 import gevent.backdoor
+import gevent.coros
 import gevent.monkey
 import gevent.pool
 import gevent.queue
@@ -59,6 +63,21 @@ def get_resp_len(resp):
     return l
 
 
+class Tokens(gevent.coros.Semaphore):
+    def __init__(self, value=1):
+        self.max_value = value
+        super(Tokens, self).__init__(value)
+
+    def resize(self, nsize):
+        if nsize == self.max_value:
+            return
+        elif nsize > self.max_value:
+            self.counter += nsize - self.max_value
+        else:
+            self.counter -= self.max_value - nsize
+        self.max_value = nsize
+
+
 class Fetchers(object):
     page_timeout = 600.0
 
@@ -66,13 +85,26 @@ class Fetchers(object):
         self.urlq = gevent.queue.JoinableQueue()
         self.pageq = outq
         self.ntries = ntries
+        self.count = count
+        self.fetched = set()
+        self.errored = set()
 
         self.fetchers = gevent.pool.Pool(size = count)
+        self.network_tokens = Tokens(count)
 
         for i in xrange(count):
-            self.fetchers.spawn(self._fetcher_proc)
+            self.fetchers.spawn(self.fetcher_proc)
 
-    def _fetch_page(self, br, url):
+    def set_size(self, count):
+        self.network_tokens.resize(count)
+
+        if count > self.count:
+            for i in xrange(count-self.count):
+                self.fetchers.spawn(self.fetcher_proc)
+
+        self.count = count
+
+    def fetch_page(self, br, url):
         try:
             with gevent.Timeout(self.page_timeout, TimeoutError):
                 return br.open(url)
@@ -92,22 +124,30 @@ class Fetchers(object):
             log.error("Unknown error %r for %s", e, url)
             raise
 
-    def _fetcher_proc(self):
+    def fetcher_proc(self):
         br = Browser()
 
         while True:
             url, tries = self.urlq.get()
 
+            if url.upper() in self.fetched:
+                log.debug("already fetched: %s", url)
+                continue
+            if url.upper() in self.errored:
+                log.debug("errored out already: %s", url)
+
             log.info("fetching %s [%d]", url, tries)
 
             try:
-                resp = self._fetch_page(br, url)
+                with self.network_token:
+                    resp = self.fetch_page(br, url)
 
                 if get_content_len(resp) > get_resp_len(resp):
                     raise ShortReadError("Expected %d bytes, but got %d" %
                                (get_content_len(resp), get_resp_len(resp)))
 
                 log.debug("success: %s", url)
+                self.fetched.add(url.upper())
                 self.pageq.put((url, resp))
 
             except Exception, err:
@@ -116,6 +156,7 @@ class Fetchers(object):
                     self.urlq.put((url, tries))
                 else:
                     log.info("Excessive failures, skipping: %s", url)
+                    self.errored.add(url.upper())
 
             finally:
                 self.urlq.task_done()
@@ -142,6 +183,7 @@ class Processors(object):
         self.output_dir = None
         self.clobber = True
         self.report = False
+        self.outfp = None
 
         for i in xrange(count):
             self.pool.spawn(self._process_worker)
@@ -163,7 +205,7 @@ class Processors(object):
         gevent.sleep(0)
 
     def put(self, (url, response)):
-            return self.process(url, response)
+        return self.process(url, response)
 
     def qsize(self):
         return self.queue.qsize()
@@ -204,17 +246,23 @@ class Processors(object):
 
         log.info("saving (%s) to '%s'", url, fname)
         try:
-            fp = open(fname, "wb")
-            fp.write(data)
-            fp.close()
+            with open(fname, "wb") as fp:
+                fp.write(data)
+            self.log_success(url,fname,len(data))
         except:
             log.error("Saving file failed: %s", fname)
             return
         if self.report:
             sys.stdout.write("%s\n" % fname)
 
+    def log_success(self, url, fname, fsize):
+        if self.outfp is not None:
+            self.outfp.write("%s,%s,%d\n" % (url,fname,fsize))
+
     def join(self):
-        return self.queue.join()
+        self.queue.join()
+        self.outfp.close()
+        return
 
 
 def set_max_fds(maxfds=8180):
@@ -257,6 +305,8 @@ def parse_args(args):
                       default=600)
     parser.add_option("--stdout", dest="report", help="report files on STDOUT",
                       action="store_true", default=False)
+    parser.add_option("--log", dest="output_log", help="keep download log",
+                      default=None)
 
     opts,args = parser.parse_args(args)
     return opts,args
@@ -266,6 +316,9 @@ def main(args):
 
     processors = Processors()
     processors.output_dir = opts.output_dir
+
+    if opts.output_log:
+        processors.outfp = open(opts.output_log, "wb+")
 
     if opts.noclobber:
         processors.clobber = False
