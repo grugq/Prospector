@@ -139,7 +139,7 @@ class Fetchers(object):
             log.info("fetching %s [%d]", url, tries)
 
             try:
-                with self.network_token:
+                with self.network_tokens:
                     resp = self.fetch_page(br, url)
 
                 if get_content_len(resp) > get_resp_len(resp):
